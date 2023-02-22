@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  transactional-outbox
+  
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: transactional-outbox-orders
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  OrderEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: transactional-outbox-order-events
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: N
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  TargetSQS:
+    Type: AWS::SQS::Queue
+
+  ThinTargetSQS:
+    Type: AWS::SQS::Queue
+
+  PipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SourcePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:ListStreams"
+                Resource: !GetAtt OrderEventsTable.StreamArn
+        - PolicyName: TargetPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sqs:sendMessage"
+                Resource: !GetAtt TargetSQS.Arn
+
+  Pipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: transactional-outbox-order-events-no-enrichment
+      Description: "Pipe to connect the dynamodb event stream to the ddestination"
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt OrderEventsTable.StreamArn
+      Target: !GetAtt TargetSQS.Arn
+      SourceParameters:
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+      TargetParameters:
+        InputTemplate: '{ "payload": <$.dynamodb.NewImage.payload>, "metadata": <$.dynamodb.NewImage.metadata> }'
+
+  PipeWithEnrichmentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SourcePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:ListStreams"
+                Resource: !GetAtt OrderEventsTable.StreamArn
+        - PolicyName: EnrichmentPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:invokeFunction"
+                Resource: !GetAtt ConvertToThinEventFunction.Arn
+        - PolicyName: TargetPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "sqs:sendMessage"
+                Resource: !GetAtt ThinTargetSQS.Arn  
+
+  PipeWithEnrichment:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: transactional-outbox-order-events-enriched
+      Description: "Pipe to connect the dynamodb event stream to the destination with thin events"
+      RoleArn: !GetAtt PipeWithEnrichmentRole.Arn
+      Source: !GetAtt OrderEventsTable.StreamArn
+      Target: !GetAtt ThinTargetSQS.Arn
+      Enrichment: !GetAtt ConvertToThinEventFunction.Arn
+      SourceParameters:
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+      EnrichmentParameters:
+        InputTemplate: '{ "payload": <$.dynamodb.NewImage.payload>, "metadata": <$.dynamodb.NewImage.metadata> }'
+
+  ConvertToThinEventFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: src/
+      Handler: convert.handler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+    Metadata: # Manage esbuild properties
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints: 
+        - convert.ts
+
+# Outputs:
+#   # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+#   # Find out more about other implicit resources you can reference within SAM
+#   # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+#   HelloWorldApi:
+#     Description: "API Gateway endpoint URL for Prod stage for Hello World function"
+#     Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/hello/"
+#   ConvertToThinEventFunction:
+#     Description: "Hello World Lambda Function ARN"
+#     Value: !GetAtt ConvertToThinEventFunction.Arn
+#   ConvertToThinEventFunctionIamRole:
+#     Description: "Implicit IAM Role created for Hello World function"
+#     Value: !GetAtt ConvertToThinEventFunctionRole.Arn
